@@ -1,0 +1,105 @@
+/*!
+This file is part of CycloneDX Webpack plugin.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+SPDX-License-Identifier: Apache-2.0
+Copyright (c) OWASP Foundation. All Rights Reserved.
+*/
+
+import { dirname } from 'node:path'
+
+import * as CDX from '@cyclonedx/cyclonedx-library'
+import type { Compilation } from 'webpack'
+
+import type { PackageDescription} from './_helpers'
+import { normalizePackageManifest, structuredClonePolyfill } from './_helpers'
+
+
+type WebpackLogger = Compilation['logger']
+
+export class RichComponentBuilder
+{
+    readonly #componentBuilder : CDX.Builders.FromNodePackageJson.ComponentBuilder
+    readonly #purlFactory : CDX.Factories.FromNodePackageJson.PackageUrlFactory
+    readonly #leGatherer: CDX.Utils.LicenseUtility.LicenseEvidenceGatherer
+
+    constructor(
+      componentBuilder: CDX.Builders.FromNodePackageJson.ComponentBuilder,
+      purlFactory: CDX.Factories.FromNodePackageJson.PackageUrlFactory,
+      leFetcher: CDX.Utils.LicenseUtility.LicenseEvidenceGatherer
+     )
+    {
+        this.#componentBuilder = componentBuilder
+        this.#purlFactory = purlFactory
+        this.#leGatherer = leFetcher
+    }
+
+  makeComponent (pkg: PackageDescription, collectEvidence: boolean, logger?: WebpackLogger): CDX.Models.Component | undefined {
+    try {
+      // work with a deep copy, because `normalizePackageManifest()` might modify the data
+      /* eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- ach */
+      const _packageJson = structuredClonePolyfill(pkg.packageJson)
+      normalizePackageManifest(_packageJson)
+      pkg.packageJson = _packageJson
+    /* c8 ignore next 3 */
+    } catch (e) {
+      logger?.warn('normalizePackageJson from PkgPath', pkg.path, 'failed:', e)
+    }
+
+    const component = this.#componentBuilder.makeComponent(
+      /* @ts-expect-error TS2559 */
+      pkg.packageJson as PackageDescription) /* eslint-disable-line  @typescript-eslint/no-unsafe-type-assertion -- ack */
+
+    if (component === undefined) {
+        return undefined
+    }
+
+    component.licenses.forEach(l => {
+      l.acknowledgement = CDX.Enums.LicenseAcknowledgement.Declared
+    })
+
+    if (collectEvidence) {
+      component.evidence = new CDX.Models.ComponentEvidence({
+        licenses: new CDX.Models.LicenseRepository(this.getLicenseEvidence(dirname(pkg.path), logger))
+      })
+    }
+
+    component.purl = this.#purlFactory.makeFromComponent(component)
+    component.bomRef.value = component.purl?.toString()
+
+    return component
+  }
+
+
+  private * getLicenseEvidence (packageDir: string, logger?: WebpackLogger): Generator<CDX.Models.License> {
+    const files = this.#leGatherer.getFileAttachments(
+      packageDir,
+      (error: Error): void => {
+        /* c8 ignore next 2 */
+        logger?.info(error.message)
+        logger?.debug(error.message, error)
+      }
+    )
+    try {
+      for (const {file, text} of files) {
+        yield new CDX.Models.NamedLicense(`file: ${file}`, { text })
+      }
+    }
+    /* c8 ignore next 3 */
+    catch (e) {
+      // generator will not throw before first `.nest()` is called ...
+      logger?.warn('collecting license evidence in', packageDir, 'failed:', e)
+    }
+  }
+}

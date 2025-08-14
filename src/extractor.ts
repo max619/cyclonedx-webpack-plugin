@@ -17,39 +17,31 @@ SPDX-License-Identifier: Apache-2.0
 Copyright (c) OWASP Foundation. All Rights Reserved.
 */
 
-import { dirname } from 'node:path'
-
-import * as CDX from '@cyclonedx/cyclonedx-library'
+import type * as CDX from '@cyclonedx/cyclonedx-library'
 import type { Compilation, Module } from 'webpack'
 
+import type {
+  PackageDescription} from './_helpers'
 import {
   getPackageDescription,
-  isNonNullable,
-  normalizePackageManifest,
-  type PackageDescription,
-  structuredClonePolyfill} from './_helpers'
+  isNonNullable} from './_helpers'
+import type {RichComponentBuilder} from './richComponentBuilder'
 
 type WebpackLogger = Compilation['logger']
 
 export class Extractor {
   readonly #compilation: Compilation
-  readonly #componentBuilder: CDX.Builders.FromNodePackageJson.ComponentBuilder
-  readonly #purlFactory: CDX.Factories.FromNodePackageJson.PackageUrlFactory
-  readonly #leGatherer: CDX.Utils.LicenseUtility.LicenseEvidenceGatherer
+  readonly #componentBuilder: RichComponentBuilder
 
   constructor (
     compilation: Compilation,
-    componentBuilder: CDX.Builders.FromNodePackageJson.ComponentBuilder,
-    purlFactory: CDX.Factories.FromNodePackageJson.PackageUrlFactory,
-    leFetcher: CDX.Utils.LicenseUtility.LicenseEvidenceGatherer
+    componentBuilder: RichComponentBuilder,
   ) {
     this.#compilation = compilation
     this.#componentBuilder = componentBuilder
-    this.#purlFactory = purlFactory
-    this.#leGatherer = leFetcher
   }
 
-  generateComponents (modules: Iterable<Module>, collectEvidence: boolean, logger?: WebpackLogger): Iterable<CDX.Models.Component> {
+  generateComponents (modules: Iterable<Module>, componentSubstitutionMap: Map<string, CDX.Models.Component>, collectEvidence: boolean, logger?: WebpackLogger): Iterable<CDX.Models.Component> {
     const pkgs: Record<string, CDX.Models.Component | undefined> = {}
     const components = new Map<Module, CDX.Models.Component>()
 
@@ -68,7 +60,7 @@ export class Extractor {
       if (component === undefined) {
         logger?.log('try to build new Component from PkgPath:', pkg.path)
         try {
-          component = this.makeComponent(pkg, collectEvidence, logger)
+          component = this.#makeComponent(pkg, componentSubstitutionMap, collectEvidence, logger)
         } catch (err) {
           logger?.debug('unexpected error:', err)
           logger?.warn('skipped Component from PkgPath', pkg.path)
@@ -90,39 +82,21 @@ export class Extractor {
   /**
    * @throws {@link Error} when no component could be fetched
    */
-  makeComponent (pkg: PackageDescription, collectEvidence: boolean, logger?: WebpackLogger): CDX.Models.Component {
-    try {
-      // work with a deep copy, because `normalizePackageManifest()` might modify the data
-      /* eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- ach */
-      const _packageJson = structuredClonePolyfill(pkg.packageJson)
-      normalizePackageManifest(_packageJson)
-      pkg.packageJson = _packageJson
-    } catch (e) {
-      logger?.warn('normalizePackageJson from PkgPath', pkg.path, 'failed:', e)
+  #makeComponent(pkg: PackageDescription, componentSubstitutionMap: Map<string, CDX.Models.Component>, collectEvidence: boolean, logger?: WebpackLogger): CDX.Models.Component
+  {
+    const newComponent = this.#componentBuilder.makeComponent(pkg, collectEvidence, logger)
+    if(newComponent === undefined) {
+      throw Error(`failed building Component from PkgPath ${pkg.path}`)
     }
 
-    const component = this.#componentBuilder.makeComponent(
-      /* @ts-expect-error TS2559 */
-      pkg.packageJson as PackageDescription) /* eslint-disable-line  @typescript-eslint/no-unsafe-type-assertion -- ack */
-
-    if (component === undefined) {
-      throw new Error(`failed building Component from PkgPath ${pkg.path}`)
+    if(newComponent.bomRef.value !== undefined) {
+      const remappedComponent = componentSubstitutionMap.get(newComponent.bomRef.value)
+      if(remappedComponent !== undefined) {
+        return remappedComponent
+      }
     }
 
-    component.licenses.forEach(l => {
-      l.acknowledgement = CDX.Enums.LicenseAcknowledgement.Declared
-    })
-
-    if (collectEvidence) {
-      component.evidence = new CDX.Models.ComponentEvidence({
-        licenses: new CDX.Models.LicenseRepository(this.getLicenseEvidence(dirname(pkg.path), logger))
-      })
-    }
-
-    component.purl = this.#purlFactory.makeFromComponent(component)
-    component.bomRef.value = component.purl?.toString()
-
-    return component
+    return newComponent
   }
 
   #linkDependencies (modulesComponents: Map<Module, CDX.Models.Component>): void {
@@ -133,27 +107,6 @@ export class Extractor {
           component.dependencies.add(dependencyBomRef)
         }
       }
-    }
-  }
-
-  public * getLicenseEvidence (packageDir: string, logger?: WebpackLogger): Generator<CDX.Models.License> {
-    const files = this.#leGatherer.getFileAttachments(
-      packageDir,
-      (error: Error): void => {
-        /* c8 ignore next 2 */
-        logger?.info(error.message)
-        logger?.debug(error.message, error)
-      }
-    )
-    try {
-      for (const {file, text} of files) {
-        yield new CDX.Models.NamedLicense(`file: ${file}`, { text })
-      }
-    }
-    /* c8 ignore next 3 */
-    catch (e) {
-      // generator will not throw before first `.nest()` is called ...
-      logger?.warn('collecting license evidence in', packageDir, 'failed:', e)
     }
   }
 }

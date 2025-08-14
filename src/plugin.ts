@@ -31,6 +31,7 @@ import {
   type PackageDescription
 } from './_helpers'
 import { Extractor } from './extractor'
+import { RichComponentBuilder } from './richComponentBuilder'
 
 type WebpackLogger = Compilation['logger']
 
@@ -211,10 +212,12 @@ export class CycloneDxWebpackPlugin {
     const cdxLicenseFactory = new CDX.Factories.LicenseFactory()
     const cdxPurlFactory = new CDX.Factories.FromNodePackageJson.PackageUrlFactory('npm')
     const cdxComponentBuilder = new CDX.Builders.FromNodePackageJson.ComponentBuilder(cdxExternalReferenceFactory, cdxLicenseFactory)
+    const richComponentBuilder = new RichComponentBuilder(cdxComponentBuilder, cdxPurlFactory, new CDX.Utils.LicenseUtility.LicenseEvidenceGatherer())
 
     const bom = new CDX.Models.Bom()
     bom.metadata.lifecycles.add(CDX.Enums.LifecyclePhase.Build)
-    bom.metadata.component = this.#makeRootComponent(compilation.compiler.context, cdxComponentBuilder, logger.getChildLogger('RootComponentBuilder'))
+    const rootComponents = this.#makeRootComponents(compilation.compiler.context, richComponentBuilder, logger.getChildLogger('RootComponentBuilder'))
+    bom.metadata.component = rootComponents?.rootComponent
 
     const serializeOptions: CDX.Serialize.Types.SerializerOptions & CDX.Serialize.Types.NormalizerOptions = {
       sortLists: this.reproducibleResults,
@@ -255,23 +258,22 @@ export class CycloneDxWebpackPlugin {
       }
     }
 
+    const componentSubstitutionMap = new Map<string, CDX.Models.Component>()
+    if(rootComponents !== undefined && rootComponents.autoDetectedRootComponent !== rootComponents.rootComponent && rootComponents.autoDetectedRootComponent.bomRef.value !== undefined) {
+      componentSubstitutionMap.set(rootComponents.autoDetectedRootComponent.bomRef.value, rootComponents.rootComponent)
+    }
     compilation.hooks.afterOptimizeTree.tap(
       pluginName,
       (_, modules) => {
         const thisLogger = logger.getChildLogger('ComponentFetcher')
         const extractor = new Extractor(
           compilation,
-          cdxComponentBuilder,
-          cdxPurlFactory,
-          new CDX.Utils.LicenseUtility.LicenseEvidenceGatherer()
+          richComponentBuilder
         )
 
         thisLogger.log('generating components...')
-        for (const component of extractor.generateComponents(modules, this.collectEvidence, thisLogger.getChildLogger('Extractor'))) {
-          if (bom.metadata.component !== undefined &&
-            bom.metadata.component.group === component.group &&
-            bom.metadata.component.name === component.name &&
-            bom.metadata.component.version === component.version
+        for (const component of extractor.generateComponents(modules, componentSubstitutionMap, this.collectEvidence, thisLogger.getChildLogger('Extractor'))) {
+          if (bom.metadata.component !== undefined && component.bomRef.value !== undefined && bom.metadata.component.bomRef.value === component.bomRef.value
           ) {
             // metadata matches this exact component.
             // -> so the component is actually treated as the root component.
@@ -376,23 +378,30 @@ export class CycloneDxWebpackPlugin {
     }
   }
 
-  #makeRootComponent (
+  #makeRootComponents (
     path: string,
-    builder: CDX.Builders.FromNodePackageJson.ComponentBuilder,
+    builder: RichComponentBuilder,
     logger: WebpackLogger
-  ): CDX.Models.Component | undefined {
-    /* eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- expected */
+  ): {rootComponent: CDX.Models.Component, autoDetectedRootComponent: CDX.Models.Component} | undefined {
+    const autoDetectedComponent = getPackageDescription(path)
     const thisPackageJson = this.rootComponentAutodetect
-      ? getPackageDescription(path)?.packageJson
-      : { name: this.rootComponentName, version: this.rootComponentVersion }
+      ? autoDetectedComponent
+      : { path, packageJson: { name: this.rootComponentName, version: this.rootComponentVersion } }
     if (thisPackageJson === undefined) { return undefined }
     normalizePackageManifest(
-       
       thisPackageJson,
       w => { logger.debug('normalizePackageJson from PkgPath', path, 'caused:', w) }
     )
-     
-    return builder.makeComponent(thisPackageJson)
+    const rootComponent = builder.makeComponent(thisPackageJson, false, logger)
+    const autoDetectedRootComponent =
+                autoDetectedComponent === thisPackageJson ?
+                  rootComponent :
+                  autoDetectedComponent !== undefined ?
+                    builder.makeComponent(autoDetectedComponent, false, logger) :
+                    undefined
+
+    if(rootComponent === undefined || autoDetectedRootComponent === undefined) { return undefined }
+    return { rootComponent, autoDetectedRootComponent }
   }
 
   #finalizeBom (
